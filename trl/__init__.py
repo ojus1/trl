@@ -71,6 +71,8 @@ _import_structure = {
         "GKDTrainer",
         "GRPOConfig",
         "GRPOTrainer",
+        "CoconutGRPOConfig",
+        "CoconutGRPOTrainer",
         "HfPairwiseJudge",
         "IterativeSFTTrainer",
         "KTOConfig",

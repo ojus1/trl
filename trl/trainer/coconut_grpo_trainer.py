@@ -9,7 +9,7 @@ from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from .grpo_trainer import GRPOTrainer
 from .coconut_grpo_config import CoconutGRPOConfig
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
-from ..import_utils import unwrap_model_for_generation
+from ..models import unwrap_model_for_generation
 
 # New trainer that applies GRPO but where the model is taught to reason in latent space (Coconut).
 class CoconutGRPOTrainer(GRPOTrainer):
