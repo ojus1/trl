@@ -82,6 +82,21 @@ Certain tasks require explicit reasoning traces (e.g., interpretability in medic
 - **Use latent reasoning for complex steps** and **CoT for user-interpretable reasoning**.
 - **Introduce a dynamic reasoning mode switch** where models choose between latent and explicit reasoning based on uncertainty.
 
+## Refactored Generation Pipeline
+
+The generation process in our latest implementation is now clearly divided into two phases:
+
+1. **Prefill Phase:**  
+   The complete input prompt is processed in a single forward pass to build the initial hidden states and caching.
+
+2. **Decoding Phase:**  
+   - In **latent generation mode**, the decoding phase is split into:
+     - **Latent-space Decoding:** The model generates a sequence of latent tokens representing a continuous chain of thought.
+     - **Token-space Decoding:** Finally, the model switches to token-space decoding (starting with a special `<eot>` token) to produce the final answer.
+   - In **non-latent (normal) mode**, only the token-space decoding phase is executed without a preceding latent decoding phase.
+
+This refactoring improves clarity and flexibility in controlling advanced reasoning tasks.
+
 ## Conclusion
 DeepSeek-R1 and Coconut represent two cutting-edge approaches to improving LLM reasoning. While DeepSeek-R1 leverages RL to refine reasoning capabilities, Coconut breaks free from language constraints to enhance efficiency and planning. Combining these methodologies could pave the way for more powerful, efficient, and interpretable AI reasoning systems. Future work should explore hybrid models that integrate reinforcement learning, latent reasoning, and distillation to create the next generation of advanced LLMs.
 

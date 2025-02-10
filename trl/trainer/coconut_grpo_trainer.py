@@ -1,17 +1,49 @@
 import random
-import torch
 import warnings
+from typing import Union, Any, Optional, Callable
 
-from transformers import GenerationConfig, PreTrainedTokenizerBase
+from typing import Any, Callable, Optional, Sized, Union
+from unittest.mock import patch
+
+import torch
+import torch.utils.data
 from accelerate.utils import broadcast_object_list, gather, gather_object
-from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+from accelerate.utils.other import is_compiled_module
+from datasets import Dataset, IterableDataset
+from packaging import version
+from torch import nn
+from torch.utils.data import Sampler
+from transformers import (
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+    TrainerCallback,
+    is_wandb_available,
+)
+from transformers.utils import is_peft_available
+
+from ..import_utils import is_vllm_available
+from ..models import unwrap_model_for_generation
 
 from .grpo_trainer import GRPOTrainer
 from .coconut_grpo_config import CoconutGRPOConfig
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from ..models import unwrap_model_for_generation
+from datasets import Dataset, IterableDataset
 
 # New trainer that applies GRPO but where the model is taught to reason in latent space (Coconut).
+
+RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+
+
+if is_peft_available():
+    from peft import PeftConfig, get_peft_model
+
+if is_vllm_available():
+    from vllm import LLM, SamplingParams
+
+if is_wandb_available():
+    import wandb
+
 class CoconutGRPOTrainer(GRPOTrainer):
     """
     A GRPOTrainer that integrates Coconut-style (latent/continuous thought) reasoning.
@@ -23,17 +55,38 @@ class CoconutGRPOTrainer(GRPOTrainer):
     number of continuous thought tokens the model should generate.
     """
     
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        
-        # Patch the model for latent reasoning
-        from patch_llm_generate import patch_generate_and_forward_for_reasoning
-        self.model = patch_generate_and_forward_for_reasoning(
-            self.model,
-            bot_token_str="<bot>",
-            tokenizer=self.processing_class,
-            default_latent_length=self.args.max_continuous_tokens
+    def __init__(
+        self,
+        model: Union[str, PreTrainedModel],
+        reward_funcs: Union[RewardFunc, list[RewardFunc]],
+        args: CoconutGRPOConfig = None,
+        train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
+        eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
+        processing_class: Optional[PreTrainedTokenizerBase] = None,
+        reward_processing_classes: Optional[Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]] = None,
+        callbacks: Optional[list[TrainerCallback]] = None,
+        optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
+        peft_config: Optional["PeftConfig"] = None,
+        prompt_preprocess_prehook: Optional[Callable[[str], str]] = None,
+        **kwargs
+    ):
+        super().__init__(
+            model=model,
+            reward_funcs=reward_funcs,
+            args=args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=processing_class,
+            reward_processing_classes=reward_processing_classes,
+            callbacks=callbacks,
+            optimizers=optimizers,
+            peft_config=peft_config,
+            **kwargs
         )
+        
+        # Store the prompt preprocessing hook if provided
+        if prompt_preprocess_prehook is not None:
+            self.prompt_preprocess_prehook = prompt_preprocess_prehook
 
         # Configure vLLM if enabled using the code from GRPOTrainer.
         if self.use_vllm:
@@ -196,7 +249,10 @@ class CoconutGRPOTrainer(GRPOTrainer):
         # Concatenate the prompt mask and completion mask.
         attention_mask = torch.cat([prompt_mask_tensor, completion_mask], dim=1)
 
-        # Decode completions for logging.
+        # Compute input embeddings from the full token sequence.
+        inputs_embeds = self.model.get_input_embeddings()(prompt_completion_ids)
+
+        # Decode the generated completions.
         completions_text = [
             self.processing_class.decode(comp, skip_special_tokens=True)
             for comp in padded_completions
@@ -219,114 +275,129 @@ class CoconutGRPOTrainer(GRPOTrainer):
                         self.model, prompt_completion_ids, attention_mask, logits_to_keep
                     )
 
-        # ------------------------------
-        # Compute rewards separately by branch.
-        # Instead of using a single branch as before, we now split the batch.
-        # (It is assumed that _compute_latent_rewards and _compute_token_rewards 
-        #  can work on a list/tensor of examples.)
+        # --- New Reward Computation Logic ---
+        # Split examples based on mode.
         import numpy as np
         modes_np = np.array(modes)
-        # Compute indices for latent and token examples.
         latent_indices = torch.tensor(np.where(modes_np == "latent")[0], dtype=torch.long, device=device)
         token_indices = torch.tensor(np.where(modes_np == "token")[0], dtype=torch.long, device=device)
-        
-        # Compute rewards for each branch. (If one branch is empty, use an empty tensor.)
+
+        # Compute rewards for latent branch.
         if latent_indices.numel() > 0:
-            latent_completion_ids = completion_ids.index_select(0, latent_indices)
             latent_prompts = [prompts[i] for i in latent_indices.tolist()]
-            latent_rewards = self._compute_latent_rewards(latent_prompts, latent_completion_ids)
-            latent_rewards_std = latent_rewards.std()  # or compute per-group std as needed
+            latent_completions = [completions_text[i] for i in latent_indices.tolist()]
+            # For latent completions, use text after <eot> for reward computation.
+            processed_latent_completions = [
+                text.split("<eot>", 1)[-1] if "<eot>" in text else text
+                for text in latent_completions
+            ]
+            latent_rewards_per_func = torch.zeros(len(latent_prompts), len(self.reward_funcs), device=device)
+            for i, (reward_func, reward_processing_class) in enumerate(
+                zip(self.reward_funcs, self.reward_processing_classes)
+            ):
+                if isinstance(reward_func, nn.Module):
+                    if is_conversational(inputs[0]):
+                        # The conversation mode: wrap as messages.
+                        messages = [
+                            {"messages": p + [{"role": "assistant", "content": c}]}
+                            for p, c in zip(latent_prompts, processed_latent_completions)
+                        ]
+                        texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                    else:
+                        texts = [p + c for p, c in zip(latent_prompts, processed_latent_completions)]
+                    reward_inputs = reward_processing_class(
+                        texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                    ).to(device)
+                    with torch.inference_mode():
+                        latent_rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]
+                else:
+                    keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                    reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                    output_reward_func = reward_func(prompts=latent_prompts, completions=processed_latent_completions, **reward_kwargs)
+                    latent_rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+            latent_rewards = latent_rewards_per_func.sum(dim=1)
+            latent_rewards_std = latent_rewards.std()
         else:
             latent_rewards = torch.tensor([], device=device)
             latent_rewards_std = torch.tensor([], device=device)
-        
+
+        # Compute rewards for token branch.
         if token_indices.numel() > 0:
             token_prompts = [prompts[i] for i in token_indices.tolist()]
             token_completions = [completions_text[i] for i in token_indices.tolist()]
-            token_rewards = self._compute_token_rewards(token_prompts, token_completions)
+            token_rewards_per_func = torch.zeros(len(token_prompts), len(self.reward_funcs), device=device)
+            for i, (reward_func, reward_processing_class) in enumerate(
+                zip(self.reward_funcs, self.reward_processing_classes)
+            ):
+                if isinstance(reward_func, nn.Module):
+                    if is_conversational(inputs[0]):
+                        messages = [
+                            {"messages": p + [{"role": "assistant", "content": c}]}
+                            for p, c in zip(token_prompts, token_completions)
+                        ]
+                        texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                    else:
+                        texts = [p + c for p, c in zip(token_prompts, token_completions)]
+                    reward_inputs = reward_processing_class(
+                        texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                    ).to(device)
+                    with torch.inference_mode():
+                        token_rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]
+                else:
+                    keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                    reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                    output_reward_func = reward_func(prompts=token_prompts, completions=token_completions, **reward_kwargs)
+                    token_rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+            token_rewards = token_rewards_per_func.sum(dim=1)
             token_rewards_std = token_rewards.std()
         else:
             token_rewards = torch.tensor([], device=device)
             token_rewards_std = torch.tensor([], device=device)
-        
-        # For training updates, combine rewards (choosing the branch-specific reward per example)
-        # Here we simply add the rewards (only one branch will be nonzero per example).
-        rewards = torch.zeros(len(prompts), device=device)
-        for i in range(len(prompts)):
-            if modes[i] == "latent":
-                rewards[i] = latent_rewards[i] if latent_rewards.numel() > i else 0.0
-            else:
-                rewards[i] = token_rewards[i] if token_rewards.numel() > i else 0.0
-        
-        # Compute advantages as before.
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
-        
-        process_slice = slice(
-            self.accelerator.process_index * len(prompts),
-            (self.accelerator.process_index + 1) * len(prompts),
-        )
-        advantages = advantages[process_slice]
-        
-        # --- Log reward metrics ---
-        # First, per reward function (using the existing aggregated rewards_per_func).
-        for i, (reward_func, reward_processing_class) in enumerate(zip(self.reward_funcs, self.reward_processing_classes)):
-            # For custom reward functions based on model config:
-            if hasattr(reward_func, "config"):
-                # (Here texts were computed earlier from prompts and completions_text.)
-                texts = [p + c for p, c in zip(prompts, completions_text)]
-                # Split texts according to generation branch.
-                latent_texts = [text for text, m in zip(texts, modes) if m == "latent"]
-                token_texts = [text for text, m in zip(texts, modes) if m == "token"]
-                
-                if latent_texts:
-                    latent_reward_inputs = reward_processing_class(
-                        latent_texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
-                    ).to(device)
-                    with torch.inference_mode():
-                        latent_rewards_per_func = reward_func(**latent_reward_inputs).logits[:, 0]
-                else:
-                    latent_rewards_per_func = torch.tensor([], device=device)
-                if token_texts:
-                    token_reward_inputs = reward_processing_class(
-                        token_texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
-                    ).to(device)
-                    with torch.inference_mode():
-                        token_rewards_per_func = reward_func(**token_reward_inputs).logits[:, 0]
-                else:
-                    token_rewards_per_func = torch.tensor([], device=device)
-                
-                # Log separate per-function metrics.
-                reward_func_name = reward_func.config._name_or_path.split("/")[-1]
-                self._metrics[f"rewards/latent_{reward_func_name}"].append(
-                    latent_rewards_per_func.mean().item() if latent_rewards_per_func.numel() > 0 else 0.0
-                )
-                self._metrics[f"rewards/token_{reward_func_name}"].append(
-                    token_rewards_per_func.mean().item() if token_rewards_per_func.numel() > 0 else 0.0
-                )
-                # Also log the overall combined reward for this function (as before)
-                self._metrics[f"rewards/{reward_func_name}"].append(rewards_per_func[:, i].mean().item())
-            else:
-                # Custom branch (if needed)
-                pass
 
-        # Log overall rewards for each branch.
+        # Combine rewards from both branches.
+        rewards = torch.zeros(len(prompts), device=device)
+        if latent_indices.numel() > 0:
+            for j, latent_idx in enumerate(latent_indices.tolist()):
+                rewards[latent_idx] = latent_rewards[j]
+        if token_indices.numel() > 0:
+            for j, token_idx in enumerate(token_indices.tolist()):
+                rewards[token_idx] = token_rewards[j]
+
+        # Log aggregated per-branch rewards for analysis.
         self._metrics["latent_reward"].append(
             latent_rewards.mean().item() if latent_rewards.numel() > 0 else 0.0
         )
         self._metrics["latent_reward_std"].append(
-            latent_rewards_std.mean().item() if latent_rewards_std.numel() > 0 else 0.0
+            latent_rewards_std.item() if latent_rewards_std.numel() > 0 else 0.0
         )
         self._metrics["token_reward"].append(
             token_rewards.mean().item() if token_rewards.numel() > 0 else 0.0
         )
         self._metrics["token_reward_std"].append(
-            token_rewards_std.mean().item() if token_rewards_std.numel() > 0 else 0.0
+            token_rewards_std.item() if token_rewards_std.numel() > 0 else 0.0
         )
-        
+
+        # Compute advantages as in original GRPO.
+        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+
+        process_slice = slice(
+            self.accelerator.process_index * len(prompts),
+            (self.accelerator.process_index + 1) * len(prompts),
+        )
+        advantages = advantages[process_slice]
+
+        # --- End Reward Computation Section ---
+
+        # Log overall rewards for each branch.
+        # (Additional logging for latent and token rewards is handled above.)
+        # The following logs overall rewards per function (as before).
+        self._metrics["reward"].append(rewards.mean().item())
+        self._metrics["reward_std"].append(std_grouped_rewards.mean().item())
+
         if (
             self.log_completions
             and self.state.global_step % self.args.logging_steps == 0
@@ -342,12 +413,70 @@ class CoconutGRPOTrainer(GRPOTrainer):
             df = pd.DataFrame(table)
             if wandb.run is not None and self.accelerator.is_main_process:
                 wandb.log({"completions": wandb.Table(dataframe=df)})
-        
+
         return {
-            "prompt_ids": prompt_ids_tensor,
-            "prompt_mask": prompt_mask_tensor,
-            "completion_ids": completion_ids,
-            "completion_mask": completion_mask,
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "answer_token_ids": completion_ids,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
         } 
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+        Compute GRPO loss using embeddings and latent states.
+        
+        The loss is computed only on the answer tokens (after <eot>), while using the full
+        sequence including latent tokens for the forward pass.
+        """
+        if return_outputs:
+            raise ValueError("The CoconutGRPOTrainer does not support returning outputs")
+
+        # Forward pass with embeddings
+        outputs = model(
+            inputs_embeds=inputs["inputs_embeds"],
+            attention_mask=inputs["attention_mask"],
+            output_hidden_states=True,
+            use_cache=False
+        )
+        
+        logits = outputs.logits
+        
+        # Get logits only for answer tokens
+        answer_tokens = inputs["answer_token_ids"]
+        answer_mask = (answer_tokens != self.processing_class.pad_token_id).float()
+        
+        # Compute log probabilities for answer tokens
+        log_probs = torch.log_softmax(logits, dim=-1)
+        answer_log_probs = torch.gather(log_probs, -1, answer_tokens.unsqueeze(-1)).squeeze(-1)
+        
+        # Mask out padding tokens
+        masked_log_probs = answer_log_probs * answer_mask
+        
+        # Compute advantages-weighted policy gradient loss
+        advantages = inputs["advantages"].unsqueeze(-1)
+        policy_loss = -(masked_log_probs * advantages).sum(dim=1) / answer_mask.sum(dim=1)
+        
+        # Add KL penalty if using reference model
+        if self.ref_model is not None:
+            with torch.no_grad():
+                ref_outputs = self.ref_model(
+                    inputs_embeds=inputs["inputs_embeds"],
+                    attention_mask=inputs["attention_mask"]
+                )
+                ref_log_probs = torch.log_softmax(ref_outputs.logits, dim=-1)
+                ref_answer_log_probs = torch.gather(ref_log_probs, -1, answer_tokens.unsqueeze(-1)).squeeze(-1)
+                
+            kl_div = (masked_log_probs - ref_answer_log_probs.detach()) * answer_mask
+            kl_penalty = self.beta * kl_div.sum(dim=1) / answer_mask.sum(dim=1)
+            
+            loss = policy_loss.mean() + kl_penalty.mean()
+        else:
+            loss = policy_loss.mean()
+
+        # Log metrics
+        self._metrics["policy_loss"].append(policy_loss.mean().item())
+        if self.ref_model is not None:
+            self._metrics["kl_div"].append(kl_div.mean().item())
+
+        return loss 
