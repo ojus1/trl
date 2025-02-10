@@ -249,8 +249,10 @@ class CoconutGRPOTrainer(GRPOTrainer):
         # Concatenate the prompt mask and completion mask.
         attention_mask = torch.cat([prompt_mask_tensor, completion_mask], dim=1)
 
-        # Compute input embeddings from the full token sequence.
+        # Instead of directly using get_input_embeddings, we'll use the model's forward pass
+        # to ensure the embeddings are connected to the graph
         inputs_embeds = self.model.get_input_embeddings()(prompt_completion_ids)
+        inputs_embeds.requires_grad_(True)  # Explicitly enable gradients
 
         # Decode the generated completions.
         completions_text = [
@@ -423,18 +425,18 @@ class CoconutGRPOTrainer(GRPOTrainer):
         } 
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """
-        Compute GRPO loss using embeddings and latent states.
-        
-        The loss is computed only on the answer tokens (after <eot>), while using the full
-        sequence including latent tokens for the forward pass.
-        """
+        """Compute GRPO loss using embeddings and latent states."""
         if return_outputs:
             raise ValueError("The CoconutGRPOTrainer does not support returning outputs")
 
+        # Ensure inputs_embeds has gradients enabled
+        inputs_embeds = inputs["inputs_embeds"]
+        if not inputs_embeds.requires_grad:
+            inputs_embeds.requires_grad_(True)
+
         # Forward pass with embeddings
         outputs = model(
-            inputs_embeds=inputs["inputs_embeds"],
+            inputs_embeds=inputs_embeds,
             attention_mask=inputs["attention_mask"],
             output_hidden_states=True,
             use_cache=False
@@ -461,7 +463,7 @@ class CoconutGRPOTrainer(GRPOTrainer):
         if self.ref_model is not None:
             with torch.no_grad():
                 ref_outputs = self.ref_model(
-                    inputs_embeds=inputs["inputs_embeds"],
+                    inputs_embeds=inputs_embeds.detach(),  # Detach for ref model
                     attention_mask=inputs["attention_mask"]
                 )
                 ref_log_probs = torch.log_softmax(ref_outputs.logits, dim=-1)

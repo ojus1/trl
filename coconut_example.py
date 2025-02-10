@@ -38,7 +38,8 @@ training_args = CoconutGRPOConfig(
     logging_steps=1,
     # gradient_checkpointing=True,
     bf16=True,
-    optim='adamw_torch_fused'
+    optim='adamw_torch_fused',
+    per_device_train_batch_size=8,
 )
 trainer = CoconutGRPOTrainer(
     model=model,
