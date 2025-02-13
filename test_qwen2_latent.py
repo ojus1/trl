@@ -4,7 +4,7 @@ from qwen2_latent import Qwen2ForCausalLM
 from qwen2_latent_config import Qwen2Config
 
 # Initialize model and tokenizer
-model_name = "Qwen/Qwen2.5-3B-Instruct"  # Using smaller model for testing
+model_name = "Qwen/Qwen2.5-0.5B-Instruct"  # Using smaller model for testing
 config = Qwen2Config.from_pretrained(model_name)
 model = Qwen2ForCausalLM.from_pretrained(model_name, config=config)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
