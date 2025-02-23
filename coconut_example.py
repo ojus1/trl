@@ -18,7 +18,7 @@ model.eot_token_id = tokenizer.convert_tokens_to_ids("<eot>")
 
 dataset = load_dataset("trl-lib/tldr", split="train")
 
-model = model.to('mps')
+model = model.to('cuda')
 
 peft_config = LoraConfig(
     r=2,
@@ -39,7 +39,9 @@ training_args = CoconutGRPOConfig(
     # gradient_checkpointing=True,
     bf16=True,
     optim='adamw_torch_fused',
-    per_device_train_batch_size=8,
+    per_device_train_batch_size=4,
+    num_generations=4,
+    latent_initial_prob=0.2
 )
 trainer = CoconutGRPOTrainer(
     model=model,

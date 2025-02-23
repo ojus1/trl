@@ -170,17 +170,25 @@ class CoconutGRPOTrainer(GRPOTrainer):
             latent_prompt_tokens = self.processing_class(
                 latent_prompt, return_tensors="pt", add_special_tokens=False
             ).to(device)
-            
-            # Generate continuous representations (hidden states)
-            latent_output = self.model.generate(latent_prompt_tokens["input_ids"])
-            return latent_output[0], "latent"
+
+            # Force generation to return latent states (which include continuous embeddings)
+            latent_output = self.model.generate(
+                latent_prompt_tokens["input_ids"],
+                input_text=latent_prompt,
+                eos_token_id=self.model.eot_token_id,
+                generation_config=self.generation_config,
+                return_latent_states=True
+            )
+            return latent_output, "latent"
         else:
             # --- Standard (token) reasoning branch ---
             token_prompt_tokens = self.processing_class(
                 prompt_text, return_tensors="pt", add_special_tokens=False
             ).to(device)
             gen_kwargs = {"max_new_tokens": self.generation_config.max_new_tokens,
-                          "attention_mask": token_prompt_tokens["attention_mask"]}
+                          "attention_mask": token_prompt_tokens["attention_mask"],
+                          "input_text": prompt_text,
+                          "eos_token_id": self.processing_class.eos_token_id}   # Pass input_text and eos_token_id to satisfy assertion
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
                 token_generated = unwrapped_model.generate(token_prompt_tokens["input_ids"], **gen_kwargs)
             token_completion = token_generated[0][token_prompt_tokens["input_ids"].size(1):]
@@ -225,13 +233,47 @@ class CoconutGRPOTrainer(GRPOTrainer):
             completions_list.append(comp)
             modes.append(mode)
         # Pad all completions to the same length.
-        comp_lengths = [comp.size(0) for comp in completions_list]
+        # For latent branch examples, use the continuous embeddings length to adjust answer_token_ids.
+        comp_lengths = []
+        for i, comp in enumerate(completions_list):
+            if modes[i] == "latent":
+                # Use the length of continuous embeddings for latent branch.
+                latent_length = comp["input_embeds"].size(1)
+                comp_lengths.append(latent_length)
+            else:
+                token_ids = comp if not isinstance(comp, dict) else comp["answer_token_ids"]
+                if token_ids.dim() == 2 and token_ids.size(0) == 1:
+                    token_ids = token_ids.squeeze(0)
+                comp_lengths.append(token_ids.size(0))
         max_completion_length = max(comp_lengths)
         padded_completions = []
-        for comp in completions_list:
-            pad_len = max_completion_length - comp.size(0)
-            padding = torch.full((pad_len,), self.processing_class.pad_token_id, dtype=comp.dtype, device=device)
-            padded_completions.append(torch.cat([comp, padding], dim=0))
+        for i, comp in enumerate(completions_list):
+            if modes[i] == "latent":
+                token_ids = comp["answer_token_ids"]
+                if token_ids.dim() == 2 and token_ids.size(0) == 1:
+                    token_ids = token_ids.squeeze(0)
+                latent_length = comp["input_embeds"].size(1)
+                # Adjust token_ids to match the continuous embeddings length.
+                if token_ids.size(0) < latent_length:
+                    pad_len = latent_length - token_ids.size(0)
+                    padding = torch.full((pad_len,), self.processing_class.pad_token_id, dtype=token_ids.dtype, device=device)
+                    token_ids = torch.cat([token_ids, padding], dim=0)
+                else:
+                    token_ids = token_ids[:latent_length]
+                # Then pad to max_completion_length if needed.
+                if token_ids.size(0) < max_completion_length:
+                    pad_len = max_completion_length - token_ids.size(0)
+                    padding = torch.full((pad_len,), self.processing_class.pad_token_id, dtype=token_ids.dtype, device=device)
+                    token_ids = torch.cat([token_ids, padding], dim=0)
+                padded_completions.append(token_ids)
+            else:
+                token_ids = comp if not isinstance(comp, dict) else comp["answer_token_ids"]
+                if token_ids.dim() == 2 and token_ids.size(0) == 1:
+                    token_ids = token_ids.squeeze(0)
+                pad_len = max_completion_length - token_ids.size(0)
+                padding = torch.full((pad_len,), self.processing_class.pad_token_id, dtype=token_ids.dtype, device=device)
+                padded_completions.append(torch.cat([token_ids, padding], dim=0))
+    
         completion_ids = torch.stack(padded_completions, dim=0)  # (B, L_completion)
 
         # Concatenate prompt and completion tokens.
@@ -249,11 +291,24 @@ class CoconutGRPOTrainer(GRPOTrainer):
         # Concatenate the prompt mask and completion mask.
         attention_mask = torch.cat([prompt_mask_tensor, completion_mask], dim=1)
 
-        # Instead of directly using get_input_embeddings, we'll use the model's forward pass
-        # to ensure the embeddings are connected to the graph
-        inputs_embeds = self.model.get_input_embeddings()(prompt_completion_ids)
-        inputs_embeds.requires_grad_(True)  # Explicitly enable gradients
-
+        # Build input embeddings per example:
+        batch_embeds = []
+        batch_size = prompt_ids_tensor.size(0)
+        for i in range(batch_size):
+            # Compute prompt embeddings from discrete tokens.
+            prompt_embeds = self.model.get_input_embeddings()(prompt_ids_list[i].unsqueeze(0))
+            if modes[i] == "latent":
+                # Use the continuous embeddings from the latent generation output.
+                # Assume the generation output (for latent branch) is a dict containing "input_embeds"
+                completion_embeds = completions_list[i]["input_embeds"]
+            else:
+                # In token mode, convert discrete tokens to embeddings.
+                completion_ids = padded_completions[i].unsqueeze(0)
+                completion_embeds = self.model.get_input_embeddings()(completion_ids)
+            full_embeds = torch.cat([prompt_embeds, completion_embeds], dim=1)
+            batch_embeds.append(full_embeds)
+        inputs_embeds = torch.cat(batch_embeds, dim=0)
+        inputs_embeds.requires_grad_(True)
         # Decode the generated completions.
         completions_text = [
             self.processing_class.decode(comp, skip_special_tokens=True)
@@ -482,3 +537,19 @@ class CoconutGRPOTrainer(GRPOTrainer):
             self._metrics["kl_div"].append(kl_div.mean().item())
 
         return loss 
+
+    def _get_per_token_logps(self, model, prompt_completion_ids, attention_mask, logits_to_keep):
+        """
+        Override _get_per_token_logps to use inputs_embeds rather than input_ids.
+        This is needed because the Qwen2ForCausalLM model does not support input_ids.
+        Instead, we compute the embeddings from prompt_completion_ids and pass them
+        to the model so that the latent tokens (and token-based decoded tokens) are used.
+        """
+        # Convert token IDs to embeddings
+        inputs_embeds = model.get_input_embeddings()(prompt_completion_ids)
+        outputs = model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+        # Return logits only for the last `logits_to_keep` tokens (as expected by subsequent computations)
+        return outputs.logits[..., -logits_to_keep:] 

@@ -4,7 +4,7 @@ from qwen2_latent import Qwen2ForCausalLM
 from qwen2_latent_config import Qwen2Config
 
 # Initialize model and tokenizer
-model_name = "Qwen/Qwen2.5-3B-Instruct"  # Using smaller model for testing
+model_name = "Qwen/Qwen2.5-0.5B-Instruct"  # Using smaller model for testing
 config = Qwen2Config.from_pretrained(model_name)
 model = Qwen2ForCausalLM.from_pretrained(model_name, config=config)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -74,7 +74,7 @@ def test_latent_reasoning():
             return outputs
 
     # Test 1: Basic latent reasoning
-    prompt = "Solve this math problem: 12 + 15 = ?"
+    prompt = "Solve this math problem: 12 + 15 = ? Say 'Hi' before anything else."
     outputs_latent = run_test(prompt, num_thoughts=3, expected_mode="latent")
     
     # Test 2: Normal generation mode
@@ -122,6 +122,72 @@ def test_latent_probing():
         answer = tokenizer.decode(outputs['generation_output']['answer_token_ids'][0])
         print(f"\nFinal answer: {answer}")
         
+def test_latent_gradients():
+    # Set model to training mode
+    model.train()
+    
+    # Prepare input with latent reasoning
+    prompt = "Solve this math problem: 12 + 15 = ? <bot><num_thoughts=3>"
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    
+    # Get input embeddings
+    input_embeds = model.get_input_embeddings()(inputs.input_ids.to(device))
+    print("input_embeds.requires_grad before forward:", input_embeds.requires_grad)
+    
+    # Forward pass with gradient tracking
+    outputs = model(
+        inputs_embeds=input_embeds,
+        input_text=prompt,
+        output_hidden_states=True,
+        # **kwargs
+    )
+    
+    # Get hidden states from the output
+    hidden_states = outputs.hidden_states[-1]  # Get last layer's hidden states
+    hidden_states.retain_grad()
+    print("hidden_states.requires_grad after forward:", hidden_states.requires_grad)
+    logits = outputs.logits
+    
+    # Generate a "target" sequence (this would normally be your desired output)
+    target_text = "The answer is 27."
+    target_ids = tokenizer(target_text, return_tensors="pt").input_ids.to(device)
+    
+    # Calculate a simple reward (could be based on any metric)
+    # Here we'll use a dummy reward of 1.0
+    reward = torch.tensor(1.0).to(device)
+    
+    # Calculate REINFORCE-like loss
+    # Log prob of generated sequence
+    log_probs = torch.log_softmax(logits[:, :-1, :], dim=-1)
+    selected_log_probs = torch.gather(
+        log_probs, 
+        -1, 
+        target_ids[:, :log_probs.size(1)].unsqueeze(-1)
+    ).squeeze(-1)
+    
+    # Only consider loss for tokens after the prompt
+    sequence_loss = -(selected_log_probs * reward).mean()
+    
+    # Backpropagate
+    sequence_loss.backward()
+    
+    # Check gradients for hidden states
+    hidden_grads = hidden_states.grad
+    if hidden_grads is not None:
+        grad_magnitudes = hidden_grads.abs().mean(dim=-1)  # Average over hidden dimension
+        print("\nGradient magnitudes across sequence:")
+        print(grad_magnitudes)
+        
+        # Verify gradients exist and are non-zero
+        assert hidden_grads.abs().sum() > 0, "No gradients found in hidden states"
+        print("\nGradient check passed successfully!")
+    else:
+        print("\nWarning: No gradients found in hidden states")
+    
+    # Reset model to eval mode
+    model.eval()
+
 if __name__ == "__main__":
     test_latent_reasoning()
-    test_latent_probing() 
+    test_latent_probing()
+    test_latent_gradients() 

@@ -1,30 +1,37 @@
+import random
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
+from qwen2_latent import Qwen2ForCausalLM
 from datasets import Dataset
 from trl import CoconutGRPOTrainer, CoconutGRPOConfig
 
+# A better reward function for testing: returns random reward values.
+def random_reward(prompts, completions, **kwargs):
+    return [random.uniform(0.0, 1.0) for _ in range(len(prompts))]
+
 def test_coconut_grpo_components():
-    # 1. Setup minimal test data
+    # Initialize model and tokenizer.
+    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+    model = Qwen2ForCausalLM.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # Add special tokens for latent reasoning.
+    special_tokens = {"additional_special_tokens": ["<bot>", "<eot>"]}
+    tokenizer.add_special_tokens(special_tokens)
+    model.bot_token_id = tokenizer.convert_tokens_to_ids("<bot>")
+    model.eot_token_id = tokenizer.convert_tokens_to_ids("<eot>")
+
+    # Setup a minimal dataset for testing.
     test_data = [
         {"prompt": "What is 2+2?", "completion": "Let me think. 2+2=4"},
         {"prompt": "What is 3+3?", "completion": "Let me calculate. 3+3=6"}
     ]
     dataset = Dataset.from_list(test_data)
 
-    # 2. Initialize model and tokenizer
-    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-    model = AutoModelForCausalLM.from_pretrained(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    
-    # Add special tokens for latent reasoning
-    special_tokens = {"additional_special_tokens": ["<bot>", "<eot>"]}
-    tokenizer.add_special_tokens(special_tokens)
+    # Use the random reward function and pass as list.
+    reward_funcs = [random_reward]
+    # For testing, pass tokenizer as the reward processing class.
+    reward_processing_classes = [tokenizer]
 
-    # 3. Create a minimal reward function for testing
-    def dummy_reward(prompts, completions):
-        return [1.0] * len(prompts)  # Always return 1.0 as reward
-
-    # 4. Setup trainer with minimal config
     config = CoconutGRPOConfig(
         output_dir="./coconut_grpo_test",
         num_train_epochs=1,
@@ -38,6 +45,8 @@ def test_coconut_grpo_components():
         latent_prob_rampup_steps=100,
         latent_initial_prob=0.1,
         latent_final_prob=0.5,
+        logging_steps=1,
+        report_to=["wandb"]  # to trigger logging paths if needed
     )
 
     trainer = CoconutGRPOTrainer(
@@ -45,45 +54,102 @@ def test_coconut_grpo_components():
         args=config,
         train_dataset=dataset,
         processing_class=tokenizer,
-        reward_funcs=dummy_reward,
+        reward_funcs=reward_funcs,
+        reward_processing_classes=reward_processing_classes,
     )
 
-    # 5. Test individual components
+    # Test that generation returns correct types for both branches.
+    def test_generate_completion_for_prompt():
+        device = trainer.accelerator.device
+
+        # Force latent branch by setting latent probability to 1.0.
+        trainer._current_latent_prob = lambda current_step: 1.0
+        latent_output, latent_mode = trainer._generate_completion_for_prompt("Test latent?", device)
+        assert latent_mode == "latent", "Expected latent mode when forced."
+        assert isinstance(latent_output, dict), "Latent output should be a dict."
+        assert "input_embeds" in latent_output, "Latent output dict missing 'input_embeds'."
+
+        # Force token branch by setting latent probability to 0.0.
+        trainer._current_latent_prob = lambda current_step: 0.0
+        token_output, token_mode = trainer._generate_completion_for_prompt("Test token?", device)
+        assert token_mode == "token", "Expected token mode when forced."
+        assert isinstance(token_output, torch.Tensor), "Token output should be a torch.Tensor."
+
+        print("✓ _generate_completion_for_prompt tests passed.")
+
+    # Test that _prepare_inputs returns expected keys and that gradients flow.
     def test_prepare_inputs():
         batch = [dataset[0], dataset[1]]
-        inputs = trainer._prepare_inputs(batch)
-        
-        # Verify shapes and gradients
-        assert inputs["inputs_embeds"].requires_grad
-        assert inputs["attention_mask"].shape == inputs["inputs_embeds"].shape[:2]
-        assert inputs["answer_token_ids"].shape[0] == len(batch)
-        print("✓ _prepare_inputs test passed")
+        # Test latent branch
+        trainer._current_latent_prob = lambda current_step: 1.0
+        inputs_latent = trainer._prepare_inputs(batch)
+        assert "inputs_embeds" in inputs_latent, "Expected key 'inputs_embeds' in prepared inputs (latent)."
+        assert "answer_token_ids" in inputs_latent, "Expected key 'answer_token_ids' in prepared inputs (latent)."
+        assert inputs_latent["inputs_embeds"].requires_grad, "inputs_embeds should require grad (latent)."
+        assert inputs_latent["attention_mask"].shape[0] == len(batch), "Attention mask batch size mismatch (latent)."
 
-    def test_compute_loss():
+        # Test token branch
+        trainer._current_latent_prob = lambda current_step: 0.0
+        inputs_token = trainer._prepare_inputs(batch)
+        assert inputs_token["inputs_embeds"].requires_grad, "inputs_embeds should require grad (token)."
+        print("✓ _prepare_inputs tests passed.")
+
+    # Test that compute_loss produces a non-error loss and that gradients flow.
+    def test_compute_loss_and_gradient():
         batch = [dataset[0], dataset[1]]
-        inputs = trainer._prepare_inputs(batch)
-        
-        # Compute loss
-        loss = trainer.compute_loss(model, inputs)
-        
-        # Verify loss requires gradient
-        assert loss.requires_grad
-        
-        # Test backward pass
-        loss.backward()
-        print("✓ compute_loss test passed")
 
+        # Token branch
+        trainer._current_latent_prob = lambda current_step: 0.0
+        inputs_token = trainer._prepare_inputs(batch)
+        # Retain gradient for the non-leaf tensor
+        inputs_token["inputs_embeds"].retain_grad()
+        loss_token = trainer.compute_loss(model, inputs_token)
+        loss_token.backward()
+        assert inputs_token["inputs_embeds"].grad is not None, "Gradient on inputs_embeds should not be None (token)."
+        first_param = next(model.parameters())
+        assert first_param.grad is not None, "At least one model parameter should have a gradient (token)."
+        print("✓ compute_loss token branch and gradient test passed.")
+
+        # Zero gradients for next test
+        model.zero_grad()
+        # Latent branch
+        trainer._current_latent_prob = lambda current_step: 1.0
+        inputs_latent = trainer._prepare_inputs(batch)
+        # Retain gradient for the non-leaf tensor
+        inputs_latent["inputs_embeds"].retain_grad()
+        loss_latent = trainer.compute_loss(model, inputs_latent)
+        loss_latent.backward()
+        assert inputs_latent["inputs_embeds"].grad is not None, "Gradient on inputs_embeds should not be None (latent)."
+        first_param = next(model.parameters())
+        assert first_param.grad is not None, "At least one model parameter should have a gradient (latent)."
+        print("✓ compute_loss latent branch and gradient test passed.")
+
+    # Test the complete training step.
     def test_training_step():
         batch = [dataset[0], dataset[1]]
         loss = trainer.training_step(model, batch)
-        print("Loss: ", loss)
-        print("✓ training_step test passed")
+        assert isinstance(loss, torch.Tensor), "Loss should be a torch.Tensor."
+        assert loss.dim() == 0, "Loss should be a scalar tensor."
+        print(f"Loss: {loss.item()}")
+        print("✓ training_step test passed.")
 
-    # Run tests
-    print("Running component tests...")
+    # Optionally, test that the random reward function produces varying rewards.
+    def test_random_reward_function():
+        rewards_set = set()
+        for _ in range(5):
+            rewards = random_reward(["a", "b", "c"], ["x", "y", "z"])
+            rewards_set.add(tuple(round(r, 3) for r in rewards))
+        # Since rewards are random, we expect variability.
+        assert len(rewards_set) > 1, "Random reward function is not varying across calls."
+        print("✓ random_reward function variability test passed.")
+
+    print("Running comprehensive component tests for CoconutGRPOTrainer...")
+    test_generate_completion_for_prompt()
     test_prepare_inputs()
-    test_compute_loss()
+    test_compute_loss_and_gradient()
     test_training_step()
+    test_random_reward_function()
+    print("All tests passed.")
 
 if __name__ == "__main__":
     test_coconut_grpo_components() 
