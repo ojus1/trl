@@ -24,7 +24,7 @@ from transformers.utils import is_peft_available
 from ..import_utils import is_vllm_available
 from ..models import unwrap_model_for_generation
 
-from .grpo_trainer import GRPOTrainer
+from .grpo_trainer import GRPOTrainer, defaultdict, is_deepspeed_zero3_enabled, is_peft_model, create_reference_model
 from .coconut_grpo_config import CoconutGRPOConfig
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from ..models import unwrap_model_for_generation
@@ -88,47 +88,35 @@ class CoconutGRPOTrainer(GRPOTrainer):
         if prompt_preprocess_prehook is not None:
             self.prompt_preprocess_prehook = prompt_preprocess_prehook
 
-        # Configure vLLM if enabled using the code from GRPOTrainer.
-        if self.use_vllm:
-            if not is_vllm_available():
-                raise ImportError(
-                    "vLLM is not available and `use_vllm` is set to True. Please install vLLM with `pip install vllm` to use it."
-                )
-            from vllm import LLM, SamplingParams
-            if self.accelerator.is_main_process:
-                vllm_device = self.args.vllm_device
-                if vllm_device == "auto":
-                    vllm_device = f"cuda:{self.accelerator.num_processes}"  # take the next GPU idx
-                if vllm_device.split(":")[0] == "cuda" and int(vllm_device.split(":")[1]) >= torch.cuda.device_count():
-                    raise ValueError(
-                        f"The requested device for vLLM ({vllm_device}) is not available. "
-                        f"Set `--num_processes` to a value lower than the number of GPUs (typically {torch.cuda.device_count() - 1})."
-                    )
-                if vllm_device in {f"cuda:{idx}" for idx in range(self.accelerator.num_processes)}:
-                    warnings.warn(
-                        f"The requested device {vllm_device} is also used for training. "
-                        "It is recommended to use a dedicated device for vLLM."
-                    )
-                from unittest.mock import patch
-                world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-                profiling_patch = patch(
-                    "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
-                    return_value=None,
-                )
-                with world_size_patch, profiling_patch:
-                    self.llm = LLM(
-                        model=self.model.config._name_or_path,
-                        device=vllm_device,
-                        gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
-                        dtype=self.args.vllm_dtype,
-                        enable_prefix_caching=True,
-                        max_model_len=self.args.vllm_max_model_len,
-                    )
-            self.sampling_params = SamplingParams(
-                temperature=self.args.temperature,
-                max_tokens=self.max_completion_length,
-            )
-            self._last_loaded_step = 0
+        # Reference model handling
+        self.beta = args.beta
+        if self.beta == 0.0 or is_peft_available() and is_peft_model(self.model):
+            # Skip reference model if beta=0 or using PEFT
+            self.ref_model = None
+        else:
+            # Load reference model as before
+            if is_deepspeed_zero3_enabled():
+                raise NotImplementedError("DeepSpeed Zero 3 is not supported for coconut grpo trainer.")
+            else:
+                self.ref_model = create_reference_model(model)
+
+        # Initialize metrics with specific keys for Coconut
+        self._metrics = {
+            "train": defaultdict(list),
+            "eval": defaultdict(list)
+        }
+        
+        # Pre-initialize all the metric keys we'll use
+        for mode in ["train", "eval"]:
+            self._metrics[mode]["latent_reward"] = []
+            self._metrics[mode]["latent_reward_std"] = []
+            self._metrics[mode]["token_reward"] = []
+            self._metrics[mode]["token_reward_std"] = []
+            self._metrics[mode]["policy_loss"] = []
+            if self.beta > 0.0 and self.ref_model is not None:
+                self._metrics[mode]["kl"] = []
+
+        self.log_completions = args.log_completions
 
     def _sample_continuous_tokens(self, current_step: int) -> int:
         """
@@ -420,40 +408,26 @@ class CoconutGRPOTrainer(GRPOTrainer):
             for j, token_idx in enumerate(token_indices.tolist()):
                 rewards[token_idx] = token_rewards[j]
 
+        # Determine current mode ("eval" if evaluating, else "train")
+        mode = "eval" if self.control.should_evaluate else "train"
+
         # Log aggregated per-branch rewards for analysis.
-        self._metrics["latent_reward"].append(
+        self._metrics[mode]["latent_reward"].append(
             latent_rewards.mean().item() if latent_rewards.numel() > 0 else 0.0
         )
-        self._metrics["latent_reward_std"].append(
+        self._metrics[mode]["latent_reward_std"].append(
             latent_rewards_std.item() if latent_rewards_std.numel() > 0 else 0.0
         )
-        self._metrics["token_reward"].append(
+        self._metrics[mode]["token_reward"].append(
             token_rewards.mean().item() if token_rewards.numel() > 0 else 0.0
         )
-        self._metrics["token_reward_std"].append(
+        self._metrics[mode]["token_reward_std"].append(
             token_rewards_std.item() if token_rewards_std.numel() > 0 else 0.0
         )
 
-        # Compute advantages as in original GRPO.
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
-
-        process_slice = slice(
-            self.accelerator.process_index * len(prompts),
-            (self.accelerator.process_index + 1) * len(prompts),
-        )
-        advantages = advantages[process_slice]
-
-        # --- End Reward Computation Section ---
-
         # Log overall rewards for each branch.
-        # (Additional logging for latent and token rewards is handled above.)
-        # The following logs overall rewards per function (as before).
-        self._metrics["reward"].append(rewards.mean().item())
-        self._metrics["reward_std"].append(std_grouped_rewards.mean().item())
+        self._metrics[mode]["reward"].append(rewards.mean().item())
+        self._metrics[mode]["reward_std"].append(rewards.std().item())
 
         if (
             self.log_completions
@@ -476,7 +450,7 @@ class CoconutGRPOTrainer(GRPOTrainer):
             "attention_mask": attention_mask,
             "answer_token_ids": completion_ids,
             "ref_per_token_logps": ref_per_token_logps,
-            "advantages": advantages,
+            "advantages": rewards,
         } 
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -514,8 +488,8 @@ class CoconutGRPOTrainer(GRPOTrainer):
         advantages = inputs["advantages"].unsqueeze(-1)
         policy_loss = -(masked_log_probs * advantages).sum(dim=1) / answer_mask.sum(dim=1)
         
-        # Add KL penalty if using reference model
-        if self.ref_model is not None:
+        # Add KL penalty only if beta > 0 and ref_model exists
+        if self.beta > 0.0 and self.ref_model is not None:
             with torch.no_grad():
                 ref_outputs = self.ref_model(
                     inputs_embeds=inputs_embeds.detach(),  # Detach for ref model
@@ -528,13 +502,17 @@ class CoconutGRPOTrainer(GRPOTrainer):
             kl_penalty = self.beta * kl_div.sum(dim=1) / answer_mask.sum(dim=1)
             
             loss = policy_loss.mean() + kl_penalty.mean()
+            
+            # Log KL metrics only when using KL penalty
+            mean_kl = ((kl_div * answer_mask).sum(dim=1) / answer_mask.sum(dim=1)).mean()
+            mode = "eval" if self.control.should_evaluate else "train"
+            self._metrics[mode]["kl"].append(mean_kl.item())
         else:
             loss = policy_loss.mean()
 
         # Log metrics
-        self._metrics["policy_loss"].append(policy_loss.mean().item())
-        if self.ref_model is not None:
-            self._metrics["kl_div"].append(kl_div.mean().item())
+        mode = "eval" if self.control.should_evaluate else "train"
+        self._metrics[mode]["policy_loss"].append(policy_loss.mean().item())
 
         return loss 
 

@@ -26,10 +26,10 @@ class CoconutGRPOConfig(GRPOConfig):
         metadata={"help": "Number of training steps over which latent reasoning probability increases."}
     )
     max_continuous_tokens: int = field(
-        default=10,
+        default=128,
         metadata={"help": "Maximum number of continuous (latent) tokens to generate."}
     )
     continuous_tokens_rampup_steps: int = field(
-        default=10000,
+        default=3000,
         metadata={"help": "Number of training steps over which the continuous token count ramps up."}
     ) 
