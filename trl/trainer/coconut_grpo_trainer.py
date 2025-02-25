@@ -500,6 +500,9 @@ class CoconutGRPOTrainer(GRPOTrainer):
         if return_outputs:
             raise ValueError("The CoconutGRPOTrainer does not support returning outputs")
 
+        # Get the current mode for metrics
+        mode = "eval" if self.control.should_evaluate else "train"
+        
         # Ensure inputs_embeds has gradients enabled
         inputs_embeds = inputs["inputs_embeds"]
         if not inputs_embeds.requires_grad:
@@ -519,6 +522,19 @@ class CoconutGRPOTrainer(GRPOTrainer):
         answer_tokens = inputs["answer_token_ids"]
         answer_mask = (answer_tokens != self.processing_class.pad_token_id).float()
         
+        # Check if answer_mask is not all zeros or empty
+        if answer_mask.sum() == 0:
+            # If we have no valid tokens, use a dummy loss
+            device = inputs_embeds.device
+            
+            # Add dummy values to metrics to avoid division by zero in logging
+            self._metrics[mode]["policy_loss"].append(0.0)
+            self._metrics[mode]["clip_ratio"].append(0.0)
+            if self.beta > 0.0 and self.ref_model is not None:
+                self._metrics[mode]["kl"].append(0.0)
+            
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
         # Compute log probabilities for answer tokens
         log_probs = torch.log_softmax(logits, dim=-1)
         answer_log_probs = torch.gather(log_probs, -1, answer_tokens.unsqueeze(-1)).squeeze(-1)
@@ -530,8 +546,23 @@ class CoconutGRPOTrainer(GRPOTrainer):
         advantages = inputs["advantages"].unsqueeze(-1)
         
         # Implement multi-step optimization - importance sampling and clipping
-        # If num_iterations is 1, use the detached log_probs as old_per_token_logps
-        old_per_token_logps = inputs["old_per_token_logps"] if self.num_iterations > 1 else masked_log_probs.detach()
+        if self.num_iterations > 1 and "old_per_token_logps" in inputs:
+            old_per_token_logps = inputs["old_per_token_logps"]
+            # Ensure shapes are compatible
+            if old_per_token_logps.shape != masked_log_probs.shape:
+                # Resize or recreate old_per_token_logps to match masked_log_probs shape
+                print(f"Shape mismatch: old_per_token_logps {old_per_token_logps.shape}, masked_log_probs {masked_log_probs.shape}")
+                
+                # If sequence dimensions don't match, we need to handle this
+                if masked_log_probs.size(1) == 0:
+                    # If masked_log_probs has empty sequence dimension, use a dummy value
+                    device = inputs_embeds.device
+                    masked_log_probs = torch.zeros_like(old_per_token_logps)
+                else:
+                    # Reshape old_per_token_logps to match masked_log_probs
+                    old_per_token_logps = old_per_token_logps[:, :masked_log_probs.size(1)]
+        else:
+            old_per_token_logps = masked_log_probs.detach()
         
         # Importance sampling ratio
         coef_1 = torch.exp(masked_log_probs - old_per_token_logps)
@@ -557,18 +588,18 @@ class CoconutGRPOTrainer(GRPOTrainer):
                 ref_answer_log_probs = torch.gather(ref_log_probs, -1, answer_tokens.unsqueeze(-1)).squeeze(-1)
                 
             kl_div = (masked_log_probs - ref_answer_log_probs.detach()) * answer_mask
-            kl_penalty = self.beta * kl_div.sum(dim=1) / answer_mask.sum(dim=1)
+            kl_penalty = self.beta * kl_div.sum(dim=1) / (answer_mask.sum(dim=1) + 1e-8)  # Add epsilon to avoid div by zero
             
-            loss = per_token_loss.sum(dim=1) / answer_mask.sum(dim=1) + kl_penalty
+            loss = per_token_loss.sum(dim=1) / (answer_mask.sum(dim=1) + 1e-8) + kl_penalty
             loss = loss.mean()
             
             # Log KL metrics only when using KL penalty
-            mean_kl = ((kl_div * answer_mask).sum(dim=1) / answer_mask.sum(dim=1)).mean()
+            mean_kl = ((kl_div * answer_mask).sum(dim=1) / (answer_mask.sum(dim=1) + 1e-8)).mean()
             mode = "eval" if self.control.should_evaluate else "train"
             self._metrics[mode]["kl"].append(mean_kl.item())
         else:
             # Normalize by token count and take mean across batch
-            loss = (per_token_loss * answer_mask).sum(dim=1) / answer_mask.sum(dim=1)
+            loss = (per_token_loss * answer_mask).sum(dim=1) / (answer_mask.sum(dim=1) + 1e-8)
             loss = loss.mean()
 
         # Log metrics
@@ -577,7 +608,7 @@ class CoconutGRPOTrainer(GRPOTrainer):
         
         # Log clip ratio metric
         is_clipped = (per_token_loss1 < per_token_loss2).float()
-        clip_ratio = (is_clipped * answer_mask).sum() / answer_mask.sum()
+        clip_ratio = (is_clipped * answer_mask).sum() / (answer_mask.sum() + 1e-8)
         self._metrics[mode]["clip_ratio"].append(clip_ratio.item())
 
         return loss
@@ -595,5 +626,52 @@ class CoconutGRPOTrainer(GRPOTrainer):
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
         )
-        # Return logits only for the last `logits_to_keep` tokens (as expected by subsequent computations)
-        return outputs.logits[..., -logits_to_keep:] 
+        
+        # Get logits only for the completion part
+        logits = outputs.logits[:, -logits_to_keep:, :]
+        
+        # Get token IDs for the completion part
+        completion_ids = prompt_completion_ids[:, -logits_to_keep:]
+        
+        # Compute log probabilities
+        log_probs = torch.log_softmax(logits, dim=-1)
+        
+        # Gather the log probabilities for each token
+        batch_size, seq_length = completion_ids.size()
+        token_log_probs = torch.zeros((batch_size, seq_length), device=logits.device)
+        
+        for batch_idx in range(batch_size):
+            for seq_idx in range(seq_length):
+                token_id = completion_ids[batch_idx, seq_idx]
+                if token_id < log_probs.size(2):  # Ensure token_id is within vocab size
+                    token_log_probs[batch_idx, seq_idx] = log_probs[batch_idx, seq_idx, token_id]
+        
+        return token_log_probs 
+
+    def log(self, logs, start_time):
+        """
+        Override log method to safely handle empty metrics lists.
+        This prevents division by zero errors when computing metric averages.
+        """
+        # Get the current mode (train or eval)
+        mode = "eval" if self.control.should_evaluate else "train"
+        
+        # Safely compute averages, avoiding division by zero
+        metrics = {}
+        for key, val in self._metrics[mode].items():
+            if val:  # Check if list is non-empty
+                metrics[key] = sum(val) / len(val)
+            else:
+                # Use a default value of 0.0 for empty metrics
+                metrics[key] = 0.0
+                print(f"Warning: Empty metric list for {key} in {mode} mode")
+        
+        # Clear metrics for the current mode
+        for val in self._metrics[mode].values():
+            val.clear()
+        
+        # Add metrics to logs
+        logs.update(metrics)
+        
+        # Call parent's log method (skip GRPOTrainer's implementation)
+        super(GRPOTrainer, self).log(logs, start_time) 
