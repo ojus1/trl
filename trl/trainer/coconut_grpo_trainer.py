@@ -113,10 +113,19 @@ class CoconutGRPOTrainer(GRPOTrainer):
             self._metrics[mode]["token_reward"] = []
             self._metrics[mode]["token_reward_std"] = []
             self._metrics[mode]["policy_loss"] = []
+            self._metrics[mode]["clip_ratio"] = []  # Add metric for clip ratio
             if self.beta > 0.0 and self.ref_model is not None:
                 self._metrics[mode]["kl"] = []
 
         self.log_completions = args.log_completions
+        
+        # Multi-step optimization parameters
+        self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
+        self.epsilon = args.epsilon
+        # Tracks the number of iterations (forward + backward passes)
+        self._step = 0
+        # Buffer the batch to reuse generated outputs across multiple updates
+        self._buffered_inputs = [None] * args.gradient_accumulation_steps
 
     def _sample_continuous_tokens(self, current_step: int) -> int:
         """
@@ -185,8 +194,30 @@ class CoconutGRPOTrainer(GRPOTrainer):
     def _prepare_inputs(self, inputs):
         """
         Prepares a batch of inputs for the GRPO update.
-        This override replaces the single-generation call with a per-example generation that randomly
-        chooses latent (continuous thought) vs. token-based reasoning.
+        In multi-step optimization, this method will either generate new completions
+        or reuse previously stored ones based on the current iteration.
+        """
+        mode = "eval" if self.control.should_evaluate else "train"
+        
+        if mode == "train":
+            # If we're at the start of a new multi-step cycle, generate new completions
+            if self.state.global_step % self.num_iterations == 0:
+                inputs = self._prepare_sample_with_completions(inputs)
+                self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = inputs
+            else:
+                # Otherwise, reuse the stored completions from the previous step
+                inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
+            self._step += 1
+        else:
+            # In evaluation, always generate new completions
+            inputs = self._prepare_sample_with_completions(inputs)
+        
+        return inputs
+
+    def _prepare_sample_with_completions(self, inputs):
+        """
+        Helper method that handles the core completion generation and processing.
+        This separates the completion generation logic from the reuse logic.
         """
         device = self.accelerator.device
         # Extract prompts from inputs.
@@ -310,7 +341,17 @@ class CoconutGRPOTrainer(GRPOTrainer):
         logits_to_keep = completion_ids.size(1)  # number of tokens in completions
 
         with torch.inference_mode():
-            if self.ref_model is not None:
+            # When using num_iterations > 1, compute and store old_per_token_logps
+            if self.num_iterations > 1:
+                old_per_token_logps = self._get_per_token_logps(
+                    self.model, prompt_completion_ids, attention_mask, logits_to_keep
+                )
+            else:
+                old_per_token_logps = None
+            
+            if self.beta == 0.0:
+                ref_per_token_logps = None
+            elif self.ref_model is not None:
                 ref_per_token_logps = self._get_per_token_logps(
                     self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
                 )
@@ -449,12 +490,13 @@ class CoconutGRPOTrainer(GRPOTrainer):
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
             "answer_token_ids": completion_ids,
+            "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": rewards,
         } 
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """Compute GRPO loss using embeddings and latent states."""
+        """Compute GRPO loss using embeddings and latent states with multi-step optimization."""
         if return_outputs:
             raise ValueError("The CoconutGRPOTrainer does not support returning outputs")
 
@@ -484,9 +526,25 @@ class CoconutGRPOTrainer(GRPOTrainer):
         # Mask out padding tokens
         masked_log_probs = answer_log_probs * answer_mask
         
-        # Compute advantages-weighted policy gradient loss
+        # Get advantages
         advantages = inputs["advantages"].unsqueeze(-1)
-        policy_loss = -(masked_log_probs * advantages).sum(dim=1) / answer_mask.sum(dim=1)
+        
+        # Implement multi-step optimization - importance sampling and clipping
+        # If num_iterations is 1, use the detached log_probs as old_per_token_logps
+        old_per_token_logps = inputs["old_per_token_logps"] if self.num_iterations > 1 else masked_log_probs.detach()
+        
+        # Importance sampling ratio
+        coef_1 = torch.exp(masked_log_probs - old_per_token_logps)
+        
+        # Clipped importance ratio
+        coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
+        
+        # Compute unclipped and clipped objectives
+        per_token_loss1 = coef_1 * advantages
+        per_token_loss2 = coef_2 * advantages
+        
+        # Take minimum to implement pessimistic bound
+        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
         
         # Add KL penalty only if beta > 0 and ref_model exists
         if self.beta > 0.0 and self.ref_model is not None:
@@ -501,20 +559,28 @@ class CoconutGRPOTrainer(GRPOTrainer):
             kl_div = (masked_log_probs - ref_answer_log_probs.detach()) * answer_mask
             kl_penalty = self.beta * kl_div.sum(dim=1) / answer_mask.sum(dim=1)
             
-            loss = policy_loss.mean() + kl_penalty.mean()
+            loss = per_token_loss.sum(dim=1) / answer_mask.sum(dim=1) + kl_penalty
+            loss = loss.mean()
             
             # Log KL metrics only when using KL penalty
             mean_kl = ((kl_div * answer_mask).sum(dim=1) / answer_mask.sum(dim=1)).mean()
             mode = "eval" if self.control.should_evaluate else "train"
             self._metrics[mode]["kl"].append(mean_kl.item())
         else:
-            loss = policy_loss.mean()
+            # Normalize by token count and take mean across batch
+            loss = (per_token_loss * answer_mask).sum(dim=1) / answer_mask.sum(dim=1)
+            loss = loss.mean()
 
         # Log metrics
         mode = "eval" if self.control.should_evaluate else "train"
-        self._metrics[mode]["policy_loss"].append(policy_loss.mean().item())
+        self._metrics[mode]["policy_loss"].append(per_token_loss.mean().item())
+        
+        # Log clip ratio metric
+        is_clipped = (per_token_loss1 < per_token_loss2).float()
+        clip_ratio = (is_clipped * answer_mask).sum() / answer_mask.sum()
+        self._metrics[mode]["clip_ratio"].append(clip_ratio.item())
 
-        return loss 
+        return loss
 
     def _get_per_token_logps(self, model, prompt_completion_ids, attention_mask, logits_to_keep):
         """
